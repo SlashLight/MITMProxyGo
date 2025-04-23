@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  mitmproxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./requests.db:/app/requests.db
+    environment:
+      - TZ=UTC
+    restart: unless-stopped
+    networks:
+      - mitm-network
+
+networks:
+  mitm-network:
+    driver: bridge 
