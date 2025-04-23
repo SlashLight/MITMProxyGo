@@ -16,9 +16,10 @@ COPY ca.crt /usr/local/share/ca-certificates/mitm-ca.crt
 
 RUN apk add --no-cache \
     ca-certificates \
-    tzdata
+    tzdata \
+    sqlite \
+    sqlite-dev
 RUN update-ca-certificates
-
 
 EXPOSE 8080
 

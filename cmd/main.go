@@ -10,7 +10,6 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
-	"io"
 	"log"
 	"math/big"
 	"net"
@@ -19,6 +18,9 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/slashlight/mitmProxy/pkg/parser"
+	"github.com/slashlight/mitmProxy/pkg/storage"
 )
 
 func buildPath(url *url.URL) string {
@@ -52,6 +54,7 @@ var (
 	certCache sync.Map
 	caCert    *x509.Certificate
 	caKey     *rsa.PrivateKey
+	db        *storage.Storage
 )
 
 func main() {
@@ -60,6 +63,12 @@ func main() {
 	if err != nil {
 		log.Fatal("Error loading CA", err)
 	}
+
+	db, err = storage.NewStorage("requests.db")
+	if err != nil {
+		log.Fatal("Error initializing database:", err)
+	}
+	defer db.Close()
 
 	listener, err := net.Listen("tcp", ":8080")
 	if err != nil {
@@ -119,6 +128,11 @@ func handleHTTP(conn net.Conn, request *http.Request) {
 	request.Host = targetAddr
 	request.URL.Path = path
 
+	parsedReq, err := parser.ParseRequest(request)
+	if err != nil {
+		fmt.Println("Error parsing request:", err)
+	}
+
 	var reqBuff bytes.Buffer
 	request.Write(&reqBuff)
 
@@ -126,7 +140,26 @@ func handleHTTP(conn net.Conn, request *http.Request) {
 		fmt.Println("Error writing to target: ", err)
 		return
 	}
-	io.Copy(conn, targetConn)
+
+	resp, err := http.ReadResponse(bufio.NewReader(targetConn), request)
+	if err != nil {
+		fmt.Println("Error reading response:", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	parsedResp, err := parser.ParseResponse(resp)
+	if err != nil {
+		fmt.Println("Error parsing response:", err)
+	}
+
+	if parsedReq != nil && parsedResp != nil {
+		if err := db.SaveRequestResponse(parsedReq, parsedResp); err != nil {
+			fmt.Println("Error saving to database:", err)
+		}
+	}
+
+	resp.Write(conn)
 }
 
 func handleHTTPS(conn net.Conn, request *http.Request) {
@@ -137,6 +170,8 @@ func handleHTTPS(conn net.Conn, request *http.Request) {
 	}
 	defer targetConn.Close()
 
+	connectHost := request.Host
+
 	conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
 	tlsConf := &tls.Config{
@@ -145,7 +180,6 @@ func handleHTTPS(conn net.Conn, request *http.Request) {
 			if host == "" {
 				host = request.URL.Hostname()
 			}
-
 			return getCert(host)
 		},
 	}
@@ -168,13 +202,68 @@ func handleHTTPS(conn net.Conn, request *http.Request) {
 		return
 	}
 
-	go io.Copy(tlsTargetConn, tlsClientConn)
-	io.Copy(tlsClientConn, tlsTargetConn)
+	reader := bufio.NewReader(tlsClientConn)
+	req, err := http.ReadRequest(reader)
+	if err != nil {
+		fmt.Println("Error reading request after CONNECT:", err)
+		return
+	}
+	defer req.Body.Close()
 
+	if req.URL.Host == "" {
+		req.URL.Host = connectHost
+	}
+
+	targetHost, targetPort, err := parseTarget(req.URL)
+	if err != nil {
+		fmt.Println("Error parsing target: ", err)
+		return
+	}
+
+	targetAddr := net.JoinHostPort(targetHost, targetPort)
+	path := buildPath(req.URL)
+
+	req.Header.Del("Proxy-Connection")
+	req.Host = targetAddr
+	req.URL.Path = path
+
+	parsedReq, err := parser.ParseRequest(req)
+	if err != nil {
+		fmt.Println("Error parsing request:", err)
+	}
+
+	var reqBuff bytes.Buffer
+	req.Write(&reqBuff)
+	if _, err := tlsTargetConn.Write(reqBuff.Bytes()); err != nil {
+		fmt.Println("Error writing to target:", err)
+		return
+	}
+
+	resp, err := http.ReadResponse(bufio.NewReader(tlsTargetConn), req)
+	if err != nil {
+		fmt.Println("Error reading response:", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	parsedResp, err := parser.ParseResponse(resp)
+	if err != nil {
+		fmt.Println("Error parsing response:", err)
+	}
+
+	if parsedReq != nil && parsedResp != nil && parsedReq.Method != "CONNECT" {
+
+		parsedReq.Headers["Host"] = targetHost
+		if err := db.SaveRequestResponse(parsedReq, parsedResp); err != nil {
+			fmt.Println("Error saving to database:", err)
+		}
+	}
+
+	resp.Write(tlsClientConn)
 }
 
 func loadCA(certFile, keyFile string) (*x509.Certificate, *rsa.PrivateKey, error) {
-	// Загрузка сертификата
+
 	certPEM, err := os.ReadFile(certFile)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to read CA cert: %v", err)
@@ -188,7 +277,6 @@ func loadCA(certFile, keyFile string) (*x509.Certificate, *rsa.PrivateKey, error
 		return nil, nil, fmt.Errorf("failed to parse CA certificate: %v", err)
 	}
 
-	// Загрузка приватного ключа
 	keyPEM, err := os.ReadFile(keyFile)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to read CA key: %v", err)
@@ -199,7 +287,7 @@ func loadCA(certFile, keyFile string) (*x509.Certificate, *rsa.PrivateKey, error
 	}
 
 	var key interface{}
-	// Пробуем разные форматы ключей
+
 	if block.Type == "RSA PRIVATE KEY" {
 		key, err = x509.ParsePKCS1PrivateKey(block.Bytes)
 	} else if block.Type == "PRIVATE KEY" {
@@ -212,7 +300,6 @@ func loadCA(certFile, keyFile string) (*x509.Certificate, *rsa.PrivateKey, error
 		return nil, nil, fmt.Errorf("failed to parse private key: %v", err)
 	}
 
-	// Приведение типа к RSA ключу
 	rsaKey, ok := key.(*rsa.PrivateKey)
 	if !ok {
 		return nil, nil, fmt.Errorf("expected RSA private key, got %T", key)
